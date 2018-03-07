@@ -595,7 +595,7 @@ foreach (analyzeDir($_SERVER['argv'][1]) as $subpath) {
 }
 
 echo "\n\n\n";
-echo "Time : " . round(microtime(true) - $begin, 3) . "ms\n";
+echo "Time : " . round(microtime(true) - $begin, 3) . "s\n";
 echo "Nb files : " . $nbFiles . "\n";
 echo "Nb components : " . $nbComponents . "\n";
 
