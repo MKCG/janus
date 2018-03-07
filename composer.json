@@ -1,0 +1,24 @@
+{
+    "name":         "mkcg/janus",
+    "description":  "Analyze dependencies of each PHP project",
+    "keywords":     ["php", "dependency", "analyzer"],
+    "type":         "library",
+    "license":      "MIT",
+
+    "authors": [
+        {
+            "name":      "Kévin Masseix",
+            "email":     "masseix.kevin@gmail.com"
+        }
+    ],
+
+    "require": {
+        "php": ">=7.0"
+    },
+
+    "autoload": {
+        "psr-4": {
+            "MKCG\\Janus\\": "src/"
+        }
+    }
+}
