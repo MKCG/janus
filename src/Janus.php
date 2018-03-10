@@ -11,6 +11,10 @@ abstract class PhpComponent
 {
     public $name;
 
+    public $tokenStartPos;
+
+    public $tokenEndPos;
+
     public function toArray() : array
     {
         $data = [];
@@ -19,7 +23,7 @@ abstract class PhpComponent
             if ($this->$name instanceof PhpComponent) {
                 $data[$name] = $this->$name->toArray();
             } elseif (is_array($this->$name)) {
-                $data[$name] = array_map(function($value) {
+                $data[$name] = array_map(function ($value) {
                     return $value instanceof PhpComponent
                         ? $value->toArray()
                         : $value;
@@ -33,6 +37,13 @@ abstract class PhpComponent
     }
 }
 
+class NamespaceComponent extends PhpComponent
+{
+    public $uses = [];
+
+    public $classes = [];
+}
+
 class InterfaceComponent extends PhpComponent
 {
     public $namespace;
@@ -42,8 +53,6 @@ class InterfaceComponent extends PhpComponent
 
 class ClassComponent extends InterfaceComponent
 {
-    public $uses = [];
-
     public $interfaces = [];
 
     public $extends;
@@ -53,6 +62,10 @@ class ClassComponent extends InterfaceComponent
     public $traitRenamedMethods = [];
 
     public $isAbstract = false;
+
+    public $constants = [];
+
+    public $properties = [];
 }
 
 class FunctionComponent extends PhpComponent
@@ -125,9 +138,175 @@ class FileAnalyzer implements ContentAnalyzer
 
     public function extract(array $tokens) : \Generator
     {
-        foreach ($this->classAnalyzer->extract($tokens) as $component) {
+        foreach ($this->extractNamespaces($tokens) as $component) {
             yield $component;
         }
+    }
+
+    private function extractNamespaces(array $tokens)
+    {
+        $namespaces = [];
+
+        $isNamespace = false;
+        $isNested = false;
+        $nestedLevel = 0;
+        $currentNamespace = '';
+        $startedPos = null;
+
+        foreach ($tokens as $pos => $token) {
+            if (!$isNamespace && !$isNested) {
+                if (is_array($token) && $token[0] === T_NAMESPACE) {
+                    $isNamespace = true;
+                    $startedPos = $pos;
+                }
+            } elseif ($isNamespace && is_array($token) && in_array($token[0], [T_NS_SEPARATOR, T_STRING], true)) {
+                $currentNamespace .= $token[1];
+            } elseif ($isNamespace && $token === ';') {
+                $namespaceComponent = new NamespaceComponent();
+                $namespaceComponent->name = $currentNamespace;
+                $namespaceComponent->tokenStartPos = $startedPos;
+                $namespaces[] = $namespaceComponent;
+
+                $isNamespace = false;
+                $startedPos = null;
+                $currentNamespace = '';
+                $isNested = false;
+                $nestedLevel = 0;
+            } elseif (($isNamespace || $isNested) && $token === '{') {
+                $isNamespace = false;
+                $isNested = true;
+                $nestedLevel++;
+            } elseif ($isNested && $token === '}') {
+                $nestedLevel--;
+
+                if ($nestedLevel === 0) {
+                    $namespaceComponent = new NamespaceComponent();
+                    $namespaceComponent->name = $currentNamespace;
+                    $namespaceComponent->tokenStartPos = $startedPos;
+                    $namespaceComponent->tokenEndPos = $pos;
+                    $namespaces[] = $namespaceComponent;
+
+                    $startedPos = null;
+                    $currentNamespace = '';
+                    $isNested = false;
+                }
+            }
+        }
+
+        if (isset($namespaces[0]) && !isset($namespaces[1]) && $namespaces[0]->tokenEndPos === null) {
+            $namespaces[0]->tokenEndPos = $pos;
+        } elseif (isset($namespaces[1])) {
+            for ($i = count($namespaces) - 1; isset($namespaces[$i]); $i--) {
+                if ($namespaces[$i]->tokenEndPos !== null) {
+                    continue;
+                }
+
+                $namespaces[$i]->tokenEndPos = !isset($namespaces[$i + 1])
+                    ? $pos
+                    : $namespaces[$i + 1]->tokenStartPos - 1;
+            }
+        } elseif (!isset($namespaces[0])) {
+            $namespaceComponent = new NamespaceComponent();
+            $namespaceComponent->name = '';
+            $namespaceComponent->tokenStartPos = 0;
+            $namespaceComponent->tokenEndPos = $pos;
+
+            $namespaces[] = $namespaceComponent;
+        }
+
+        $namespaces = array_map(function (NamespaceComponent $namespace) use ($tokens) {
+            $namespaceTokens = array_slice($tokens, $namespace->tokenStartPos, $namespace->tokenEndPos - $namespace->tokenStartPos, true);
+            $namespace->uses = $this->extractUsedClasses($namespaceTokens);
+
+            foreach ($this->classAnalyzer->extract($namespaceTokens) as $classComponent) {
+                $namespace->classes[] = $classComponent;
+            }
+
+            return $namespace;
+        }, $namespaces);
+
+        return $namespaces;
+    }
+
+    private function extractUsedClasses(array $tokens)
+    {
+        $classes = [];
+        $currentClass = '';
+        $currentAlias = '';
+        $multiplePrefix = '';
+
+        $isUse = false;
+        $isMultiple = false;
+        $isAlias = false;
+
+        // Used to prevent anonym function "use" token to be detected as namespace use
+        $isFunction = false;
+
+        foreach ($tokens as $pos => $token) {
+            if (!$isUse) {
+                if (!$isFunction && is_array($token) && $token[0] === T_FUNCTION) {
+                    $isFunction = true;
+                    continue;
+                }
+
+                if ($isFunction && $token === ';') {
+                    $isFunction = false;
+                    continue;
+                }
+
+                if (!$isFunction && is_array($token) && $token[0] === T_USE) {
+                    $isUse = true;
+                    continue;
+                }
+            }
+
+            if ($isUse && in_array($token, [';', '}'])) {
+                if (!$isAlias) {
+                    $classes[$currentClass] = $currentClass;
+                } else {
+                    $classes[$currentAlias] = $currentClass;
+                }
+
+                $isUse = false;
+                $isAlias = false;
+                $isMultiple = false;
+                $currentClass = '';
+                $currentAlias = '';
+                $multiplePrefix = '';
+            } elseif ($isUse && $token === '{') {
+                $isMultiple = true;
+                $multiplePrefix = $currentClass;
+                $currentClass = '';
+            } elseif ($isUse && $isMultiple && $token === ',') {
+                $currentClass = $multiplePrefix . '\\' . $currentClass;
+
+                if (!$isAlias) {
+                    $classes[$currentClass] = $currentClass;
+                } else {
+                    $classes[$currentAlias] = $currentClass;
+                }
+
+                $isAlias = false;
+                $currentClass = '';
+                $currentAlias = '';
+            }
+
+            if (!$isUse || !is_array($token)) {
+                continue;
+            }
+
+            if (in_array($token[0], [T_NS_SEPARATOR, T_STRING], true)) {
+                if ($isAlias) {
+                    $currentAlias .= $token[1];
+                } else {
+                    $currentClass .= $token[1];
+                }
+            } elseif ($token[0] === T_AS) {
+                $isAlias = true;
+            }
+        }
+
+        return $classes;
     }
 }
 
@@ -148,6 +327,9 @@ class ClassAnalyzer implements ContentAnalyzer
         $isFinal            = false;
         $nestedLevel        = 0;
 
+        $startedPos = -1;
+        $endedPos = -1;
+
         foreach ($tokens as $pos => $token) {
             if (!isset($currentClassTokens[0]) && is_array($token) && in_array($token[0], [T_ABSTRACT, T_FINAL, T_CLASS], true)) {
                 $followingTokens = array_slice($tokens, $pos + 1, 4);
@@ -159,6 +341,7 @@ class ClassAnalyzer implements ContentAnalyzer
                     continue;
                 }
 
+                $startedPos = $pos;
                 $isAbstract = $token[0] === T_ABSTRACT || in_array(T_ABSTRACT, $tokenTypes, true);
                 $isFinal    = $token[0] === T_FINAL || in_array(T_FINAL, $tokenTypes, true);
             } elseif (!$isClass) {
@@ -173,9 +356,13 @@ class ClassAnalyzer implements ContentAnalyzer
                 $nestedLevel--;
 
                 if ($nestedLevel === 0) {
+                    $endedPos = $pos;
                     $classComponent = $this->createClass($currentClassTokens);
                     $classComponent->isAbstract = $isAbstract;
                     $classComponent->isFinal    = $isFinal;
+
+                    $classComponent->tokenStartPos = $startedPos;
+                    $classComponent->tokenEndPos   = $endedPos;
 
                     yield $classComponent;
 
@@ -344,9 +531,9 @@ class FunctionAnalyzer implements ContentAnalyzer
                     continue;
                 }
 
-                $isAbstract = $token[0] === T_ABSTRACT || in_array(T_ABSTRACT,  $followingTypes, true);
-                $isStatic   = $token[0] === T_STATIC   || in_array(T_STATIC,    $followingTypes, true);
-                $isFinal    = $token[0] === T_FINAL    || in_array(T_FINAL,     $followingTypes, true);
+                $isAbstract = $token[0] === T_ABSTRACT || in_array(T_ABSTRACT, $followingTypes, true);
+                $isStatic   = $token[0] === T_STATIC   || in_array(T_STATIC, $followingTypes, true);
+                $isFinal    = $token[0] === T_FINAL    || in_array(T_FINAL, $followingTypes, true);
 
                 $visibilityTokens = in_array($token[0], [T_PUBLIC, T_PRIVATE, T_PROTECTED], true)
                     ? [$token[0]]
@@ -541,7 +728,7 @@ class ParamAnalyzer implements ContentAnalyzer
                 }
                 break;
             default:
-                $defaultValue = array_map(function($token) {
+                $defaultValue = array_map(function ($token) {
                     if ($token === '(') {
                         return '[';
                     } elseif ($token === ')') {
@@ -556,7 +743,7 @@ class ParamAnalyzer implements ContentAnalyzer
                 }, $assignmentTokens);
 
                 //@todo convert it into an array
-                $defaultValue = array_reduce($defaultValue, function($current, $value) {
+                $defaultValue = array_reduce($defaultValue, function ($current, $value) {
                     return $current . $value;
                 });
 
@@ -572,7 +759,8 @@ $janus = new Janus(
     new FileAnalyzer(
         new ClassAnalyzer(new FunctionAnalyzer(new ParamAnalyzer())),
         new FunctionAnalyzer(new ParamAnalyzer())
-));
+    )
+);
 
 
 $begin = microtime(true);
@@ -598,7 +786,7 @@ echo "\n\n\n";
 echo "Time : " . round(microtime(true) - $begin, 3) . "s\n";
 echo "Nb files : " . $nbFiles . "\n";
 echo "Nb components : " . $nbComponents . "\n";
-
+echo "Peak memory : " . round(memory_get_peak_usage(true) / 1024 / 1024, 3) . "MB\n";
 
 function analyzeDir(string $path)
 {
