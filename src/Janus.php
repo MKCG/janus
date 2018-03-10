@@ -61,7 +61,11 @@ class ClassComponent extends InterfaceComponent
 
     public $traitRenamedMethods = [];
 
+    public $isAnonym = false;
+
     public $isAbstract = false;
+
+    public $isFinal = false;
 
     public $constants = [];
 
@@ -74,10 +78,6 @@ class FunctionComponent extends PhpComponent
 
     public $returnType;
 
-    public $namespace;
-
-    public $class;
-
     public $visibility;
 
     public $isStatic = false;
@@ -89,15 +89,25 @@ class FunctionComponent extends PhpComponent
     public $isFinal = false;
 }
 
-class ParamComponent extends PhpComponent
+class VariableComponent extends PhpComponent
 {
     public $type;
 
-    public $hasDefaultValue;
+    public $hasDefaultValue = false;
 
     public $defaultValue;
+}
 
+class ParamComponent extends VariableComponent
+{
     public $isVariadic = false;
+}
+
+class PropertyComponent extends VariableComponent
+{
+    public $isStatic = false;
+
+    public $visibility;
 }
 
 class Janus implements ContentAnalyzer
@@ -382,7 +392,18 @@ class ClassAnalyzer implements ContentAnalyzer
         $component->name        = $this->extractName($tokens);
         $component->interfaces  = $this->extractInterfaces($tokens);
         $component->extends     = $this->extractExtends($tokens);
-        $component->methods     = $this->extractMethods($tokens);
+
+        $innerTokens = $tokens;
+
+        foreach ($tokens as $pos => $token) {
+            if ($token === '{') {
+                $innerTokens = array_slice($tokens, $pos + 1, count($tokens) - $pos - 2);
+                break;
+            }
+        }
+
+        $component->methods     = $this->extractMethods($innerTokens);
+        $component->properties  = $this->extractProperties($innerTokens);
 
         return $component;
     }
@@ -464,13 +485,6 @@ class ClassAnalyzer implements ContentAnalyzer
 
     private function extractMethods(array $tokens)
     {
-        foreach ($tokens as $pos => $token) {
-            if ($token === '{') {
-                $tokens = array_slice($tokens, $pos + 1, count($tokens) - $pos - 2);
-                break;
-            }
-        }
-
         $methods = [];
 
         foreach ($this->functionAnalyzer->extract($tokens) as $component) {
@@ -478,6 +492,89 @@ class ClassAnalyzer implements ContentAnalyzer
         }
 
         return $methods;
+    }
+
+    private function extractProperties(array $tokens)
+    {
+        $properties = [];
+
+        $isFunction = false;
+        $nestedLevel = 0;
+
+        $currentProperty = null;
+
+        $isAssignment = false;
+        $assignmentTokens = [];
+
+        foreach ($tokens as $pos => $token) {
+            if ($isFunction) {
+                if ($nestedLevel === 0 && $token === ';') {
+                    $isFunction = false;
+                } elseif ($token === '{') {
+                    $nestedLevel++;
+                } elseif ($token === '}') {
+                    $nestedLevel--;
+                    $isFunction = $nestedLevel !== 0;
+                }
+            } elseif (is_array($token) && $token[0] === T_FUNCTION) {
+                $isFunction = true;
+            }
+
+            if ($isFunction) {
+                continue;
+            }
+
+            if ($currentProperty === null && is_array($token) && in_array($token[0], [T_VARIABLE], true)) {
+                $currentProperty = new PropertyComponent();
+                $currentProperty->name = substr($token[1], 1);
+
+                $sliceBegin = max($pos - 4, 0);
+                $sliceLength = max($pos - $sliceBegin, 0);
+
+                $previousTokens = array_slice($tokens, $sliceBegin, $sliceLength, true);
+                $previousTokens = array_filter($previousTokens, 'is_array');
+
+                array_walk($previousTokens, function($token) use ($currentProperty) {
+                    switch ($token[0]) {
+                        case T_STATIC:
+                            $currentProperty->isStatic = true;
+                            break;
+                        case T_PUBLIC:
+                            $currentProperty->visibility = 'public';
+                            break;
+                        case T_PROTECTED:
+                            $currentProperty->visibility = 'protected';
+                            break;
+                        case T_PRIVATE:
+                            $currentProperty->visibility = 'private';
+                            break;
+                    }
+                });
+
+                continue;
+            }
+
+            if ($currentProperty === null) {
+                continue;
+            }
+
+            if ($token === ';') {
+                if ($isAssignment) {
+                    ParamAnalyzer::assignDefaultValue($currentProperty, $assignmentTokens);
+                }
+
+                $properties[] = $currentProperty;
+                $currentProperty = null;
+                $isAssignment = false;
+                $assignmentTokens = [];
+            } elseif ($token === '=') {
+                $isAssignment = true;
+            } elseif ($isAssignment && (!is_array($token) || $token[0] !== T_WHITESPACE)) {
+                $assignmentTokens[] = $token;
+            }
+        }
+
+        return $properties;
     }
 }
 
@@ -710,20 +807,27 @@ class ParamAnalyzer implements ContentAnalyzer
             }
         }
 
+        static::assignDefaultValue($paramComponent, $assignmentTokens);
+
+        return $paramComponent;
+    }
+
+    public static function assignDefaultValue(VariableComponent $varComponent, array $assignmentTokens)
+    {
         switch (count($assignmentTokens)) {
             case 0:
                 break;
             case 1 and is_array($assignmentTokens[0]):
-                $paramComponent->hasDefaultValue = true;
+                $varComponent->hasDefaultValue = true;
                 switch ($assignmentTokens[0][1]) {
                     case 'array':
-                        $paramComponent->defaultValue = [];
+                        $varComponent->defaultValue = [];
                         break;
                     case 'null':
-                        $paramComponent->defaultValue = null;
+                        $varComponent->defaultValue = null;
                         break;
                     default:
-                        $paramComponent->defaultValue = $assignmentTokens[0][1];
+                        $varComponent->defaultValue = $assignmentTokens[0][1];
                         break;
                 }
                 break;
@@ -747,11 +851,10 @@ class ParamAnalyzer implements ContentAnalyzer
                     return $current . $value;
                 });
 
-                $paramComponent->defaultValue = $defaultValue;
+                $varComponent->hasDefaultValue = true;
+                $varComponent->defaultValue = $defaultValue;
                 break;
         }
-
-        return $paramComponent;
     }
 }
 
