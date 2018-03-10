@@ -729,7 +729,7 @@ class FunctionAnalyzer implements ContentAnalyzer
         $functionComponent = new FunctionComponent();
 
         try {
-            $functionComponent->name    = $this->extractName($headerTokens);
+            $functionComponent->name = $this->extractName($headerTokens);
         } catch (\Exception $e) {
             //var_dump($e->getTrace());
         }
@@ -780,7 +780,7 @@ class FunctionAnalyzer implements ContentAnalyzer
                 && isset($tokens[$pos + 1])
                 && $tokens[$pos + 1] === '('
                 && (!isset($tokens[$pos - 1])
-                    || !in_array($tokens[$pos - 1][0], [T_OBJECT_OPERATOR, T_NEW, T_PAAMAYIM_NEKUDOTAYIM], true)
+                    || !in_array($tokens[$pos - 1][0], [T_NS_SEPARATOR, T_OBJECT_OPERATOR, T_NEW, T_PAAMAYIM_NEKUDOTAYIM], true)
             )) {
                 $called[] = $token[1];
             }
@@ -802,13 +802,26 @@ class FunctionAnalyzer implements ContentAnalyzer
         $tokens = array_values($tokens);
 
         foreach ($tokens as $pos => $token) {
-            if (is_array($token)
-                && $token[0] === T_STRING
-                && isset($tokens[$pos - 1])
-                && is_array($tokens[$pos - 1])
-                && $tokens[$pos - 1][0] === T_NEW
+            if (!is_array($token) || $token[0] !== T_STRING || !isset($tokens[$pos - 1]) || !is_array($tokens[$pos - 1])) {
+                continue;
+            }
+
+            if ($tokens[$pos - 1][0] === T_NEW
+                || ($tokens[$pos - 1][0] === T_NS_SEPARATOR
+                    && isset($tokens[$pos - 2])
+                    && is_array($tokens[$pos - 2])
+                    && $tokens[$pos - 2][0] === T_NEW
+                )
             ) {
-                $instantiated[] = $token[1];
+                $className = $tokens[$pos - 1][0] === T_NS_SEPARATOR
+                    ? $tokens[$pos - 1][1]
+                    : '';
+
+                for ($i = $pos; isset($tokens[$i]) && is_array($tokens[$i]) && in_array($tokens[$i][0], [T_NS_SEPARATOR, T_STRING], true); $i++) {
+                    $className .= $tokens[$i][1];
+                }
+
+                $instantiated[] = $className;
             }
         }
 
