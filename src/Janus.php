@@ -91,6 +91,8 @@ class FunctionComponent extends PhpComponent
     public $callMethods = [];
 
     public $instantiated = [];
+
+    public $usedConstants = [];
 }
 
 class VariableComponent extends PhpComponent
@@ -127,6 +129,10 @@ class Janus implements ContentAnalyzer
     {
         $contents = file_get_contents($path);
         $tokens = token_get_all($contents);
+
+        if (empty($tokens)) {
+            return;
+        }
 
         foreach ($this->extract($tokens) as $component) {
             yield $component;
@@ -378,7 +384,7 @@ class ClassAnalyzer implements ContentAnalyzer
                     $classComponent->tokenStartPos = $startedPos;
                     $classComponent->tokenEndPos   = $endedPos;
 
-                    array_walk($classComponent->methods, function($method) use ($startedPos) {
+                    array_walk($classComponent->methods, function ($method) use ($startedPos) {
                         $method->tokenStartPos += $startedPos;
                         $method->tokenEndPos += $startedPos;
                     });
@@ -670,9 +676,11 @@ class FunctionAnalyzer implements ContentAnalyzer
                 }
             }
 
-            if ($isMethod) {
-                $currFunctionTokens[] = $token;
+            if (!$isMethod) {
+                continue;
             }
+
+            $currFunctionTokens[] = $token;
 
             if ($token === '{') {
                 $nestedLevel++;
@@ -729,6 +737,7 @@ class FunctionAnalyzer implements ContentAnalyzer
         $functionComponent->params  = $this->extractParams($headerTokens);
         $functionComponent->callMethods = $this->extractCalledFunctions($innerTokens);
         $functionComponent->instantiated = $this->extractInstantiatedClasses($innerTokens);
+        $functionComponent->usedConstants = $this->extractConstants($innerTokens);
 
         return $functionComponent;
     }
@@ -771,11 +780,13 @@ class FunctionAnalyzer implements ContentAnalyzer
                 && isset($tokens[$pos + 1])
                 && $tokens[$pos + 1] === '('
                 && (!isset($tokens[$pos - 1])
-                    || !in_array($tokens[$pos - 1][0], [T_OBJECT_OPERATOR, T_NEW], true)
+                    || !in_array($tokens[$pos - 1][0], [T_OBJECT_OPERATOR, T_NEW, T_PAAMAYIM_NEKUDOTAYIM], true)
             )) {
                 $called[] = $token[1];
             }
         }
+
+        $called = countAggreg($called);
 
         return $called;
     }
@@ -801,7 +812,108 @@ class FunctionAnalyzer implements ContentAnalyzer
             }
         }
 
+        $instantiated = countAggreg($instantiated);
+
         return $instantiated;
+    }
+
+    private function extractConstants(array $tokens)
+    {
+        $constants = [];
+        $usedPos = [];
+
+        foreach ($tokens as $pos => $token) {
+            if (is_array($token) && $token[0] === T_PAAMAYIM_NEKUDOTAYIM) {
+                if ($tokens[$pos + 2] === '(') {
+                    continue;
+                } elseif (isset($tokens[$pos + 3]) && $tokens[$pos + 3] === '(') {
+                    continue;
+                } elseif (!is_array($tokens[$pos + 1]) || strpos($tokens[$pos + 1][1], '$') === 0) {
+                    continue;
+                }
+
+                $constantClass = '';
+
+                for ($i = $pos - 1; isset($tokens[$i]); $i--) {
+                    if (is_array($tokens[$i]) && $tokens[$i][0] === T_WHITESPACE && $i === $pos - 1) {
+                        continue;
+                    }
+
+                    if (!is_array($tokens[$i]) || $tokens[$i][0] === T_WHITESPACE) {
+                        break;
+                    }
+
+                    $constantClass = $tokens[$i][1] . $constantClass;
+                    $usedPos[$i] = true;
+                }
+
+                $usedPos[$pos + 1] = true;
+                $constants[] = $constantClass . '::' . $tokens[$pos + 1][1];
+            }
+        }
+
+        foreach ($tokens as $pos => $token) {
+            if (!is_array($token) || $token[0] !== T_STRING || isset($usedPos[$pos])) {
+                continue;
+            }
+
+            if (in_array(strtolower($token[1]), ['true', 'false', 'null'], true)) {
+                continue;
+            }
+
+            if (isset($tokens[$pos + 1])) {
+                // : is used by labels
+                if (in_array($tokens[$pos + 1], [':', '('])) {
+                    continue;
+                }
+
+                if (is_array($tokens[$pos + 1]) && in_array($tokens[$pos + 1][0], [T_PAAMAYIM_NEKUDOTAYIM], true)) {
+                    continue;
+                }
+            }
+
+            if (isset($tokens[$pos - 1]) && is_array($tokens[$pos - 1]) && $tokens[$pos - 1][0] === T_OBJECT_OPERATOR) {
+                continue;
+            }
+
+            $previousTokens = array_slice($tokens, max($pos - 3, 0), max($pos - max($pos - 3, 0), 0));
+            $previousTokens = array_filter($previousTokens, function ($token) {
+                return !is_array($token) || $token[0] !== T_WHITESPACE;
+            });
+
+            $lastToken = end($previousTokens);
+            $anteToken = prev($previousTokens);
+
+            if (is_array($lastToken) && in_array($lastToken[0], [T_NEW, T_NS_SEPARATOR, T_INSTANCEOF, T_GOTO], true)) {
+                continue;
+            }
+
+            if ($lastToken === '(' && is_array($anteToken) && in_array($anteToken[0], [T_FUNCTION, T_DECLARE], true)) {
+                continue;
+            }
+
+            if ($lastToken === ':') {
+                continue;
+            }
+
+            if (isset($tokens[$pos + 1]) && is_array($tokens[$pos + 1])) {
+                if (in_array($tokens[$pos + 1][0], [T_VARIABLE, T_NS_SEPARATOR], true)) {
+                    continue;
+                }
+
+                if ($tokens[$pos + 1][0] === T_WHITESPACE
+                    && isset($tokens[$pos + 2]) && is_array($tokens[$pos + 2 ]) && $tokens[$pos + 2][0] === T_VARIABLE
+                ) {
+                    continue;
+                }
+            }
+
+            $constants[] = $token[1];
+        }
+
+        $constants = countAggreg($constants);
+
+        return $constants;
     }
 }
 
@@ -991,4 +1103,21 @@ function analyzeDir(string $path)
             yield $subpath;
         }
     }
+}
+
+function countAggreg(array $values)
+{
+    return array_reduce($values, function ($acc, $value) {
+        if ($acc === null) {
+            $acc = [];
+        }
+
+        if (!isset($acc[$value])) {
+            $acc[$value] = 1;
+        } else {
+            $acc[$value]++;
+        }
+
+        return $acc;
+    });
 }
