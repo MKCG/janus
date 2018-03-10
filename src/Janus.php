@@ -87,6 +87,10 @@ class FunctionComponent extends PhpComponent
     public $isAbstract = false;
 
     public $isFinal = false;
+
+    public $callMethods = [];
+
+    public $instantiated = [];
 }
 
 class VariableComponent extends PhpComponent
@@ -288,7 +292,7 @@ class FileAnalyzer implements ContentAnalyzer
                 $multiplePrefix = $currentClass;
                 $currentClass = '';
             } elseif ($isUse && $isMultiple && $token === ',') {
-                $currentClass = $multiplePrefix . '\\' . $currentClass;
+                $currentClass = $multiplePrefix . $currentClass;
 
                 if (!$isAlias) {
                     $classes[$currentClass] = $currentClass;
@@ -374,6 +378,11 @@ class ClassAnalyzer implements ContentAnalyzer
                     $classComponent->tokenStartPos = $startedPos;
                     $classComponent->tokenEndPos   = $endedPos;
 
+                    array_walk($classComponent->methods, function($method) use ($startedPos) {
+                        $method->tokenStartPos += $startedPos;
+                        $method->tokenEndPos += $startedPos;
+                    });
+
                     yield $classComponent;
 
                     $currentClassTokens = [];
@@ -402,7 +411,12 @@ class ClassAnalyzer implements ContentAnalyzer
             }
         }
 
-        $component->methods     = $this->extractMethods($innerTokens);
+        foreach ($this->extractMethods($innerTokens) as $method) {
+            $method->tokenStartPos += $pos + 1;
+            $method->tokenEndPos += $pos + 1;
+            $component->methods[] = $method;
+        }
+
         $component->properties  = $this->extractProperties($innerTokens);
 
         return $component;
@@ -534,7 +548,7 @@ class ClassAnalyzer implements ContentAnalyzer
                 $previousTokens = array_slice($tokens, $sliceBegin, $sliceLength, true);
                 $previousTokens = array_filter($previousTokens, 'is_array');
 
-                array_walk($previousTokens, function($token) use ($currentProperty) {
+                array_walk($previousTokens, function ($token) use ($currentProperty) {
                     switch ($token[0]) {
                         case T_STATIC:
                             $currentProperty->isStatic = true;
@@ -596,6 +610,7 @@ class FunctionAnalyzer implements ContentAnalyzer
         $isAnonym       = false;
         $visibility     = 'public';
         $nestedLevel    = 0;
+        $startedPos;
 
         $currFunctionTokens = [];
 
@@ -628,6 +643,7 @@ class FunctionAnalyzer implements ContentAnalyzer
                     continue;
                 }
 
+                $startedPos = $pos;
                 $isAbstract = $token[0] === T_ABSTRACT || in_array(T_ABSTRACT, $followingTypes, true);
                 $isStatic   = $token[0] === T_STATIC   || in_array(T_STATIC, $followingTypes, true);
                 $isFinal    = $token[0] === T_FINAL    || in_array(T_FINAL, $followingTypes, true);
@@ -669,6 +685,8 @@ class FunctionAnalyzer implements ContentAnalyzer
                     $functionComponent->isFinal  = $isFinal;
                     $functionComponent->isAbstract = $isAbstract;
                     $functionComponent->visibility = $visibility;
+                    $functionComponent->tokenStartPos = $startedPos;
+                    $functionComponent->tokenEndPos = $pos;
 
                     yield $functionComponent;
 
@@ -679,6 +697,7 @@ class FunctionAnalyzer implements ContentAnalyzer
                     $isAnonym       = false;
                     $visibility     = 'public';
                     $nestedLevel    = 0;
+                    $startedPos = null;
 
                     $currFunctionTokens = [];
                 }
@@ -688,15 +707,28 @@ class FunctionAnalyzer implements ContentAnalyzer
 
     private function createFunction(array $tokens)
     {
+        $innerTokens = $tokens;
+        $headerTokens = $tokens;
+
+        foreach ($tokens as $pos => $token) {
+            if ($token === '{') {
+                $innerTokens = array_slice($tokens, $pos + 1, count($tokens) - $pos - 2);
+                $headerTokens = array_slice($tokens, 0, $pos - 1);
+                break;
+            }
+        }
+
         $functionComponent = new FunctionComponent();
 
         try {
-            $functionComponent->name    = $this->extractName($tokens);
+            $functionComponent->name    = $this->extractName($headerTokens);
         } catch (\Exception $e) {
-
+            //var_dump($e->getTrace());
         }
 
-        $functionComponent->params  = $this->extractParams($tokens);
+        $functionComponent->params  = $this->extractParams($headerTokens);
+        $functionComponent->callMethods = $this->extractCalledFunctions($innerTokens);
+        $functionComponent->instantiated = $this->extractInstantiatedClasses($innerTokens);
 
         return $functionComponent;
     }
@@ -722,6 +754,55 @@ class FunctionAnalyzer implements ContentAnalyzer
 
         return $params;
     }
+
+    private function extractCalledFunctions(array $tokens)
+    {
+        $called = [];
+
+        $tokens = array_filter($tokens, function ($token) {
+            return !is_array($token) || $token[0] !== T_WHITESPACE;
+        });
+
+        $tokens = array_values($tokens);
+
+        foreach ($tokens as $pos => $token) {
+            if (is_array($token)
+                && $token[0] === T_STRING
+                && isset($tokens[$pos + 1])
+                && $tokens[$pos + 1] === '('
+                && (!isset($tokens[$pos - 1])
+                    || !in_array($tokens[$pos - 1][0], [T_OBJECT_OPERATOR, T_NEW], true)
+            )) {
+                $called[] = $token[1];
+            }
+        }
+
+        return $called;
+    }
+
+    private function extractInstantiatedClasses(array $tokens)
+    {
+        $instantiated = [];
+
+        $tokens = array_filter($tokens, function ($token) {
+            return !is_array($token) || $token[0] !== T_WHITESPACE;
+        });
+
+        $tokens = array_values($tokens);
+
+        foreach ($tokens as $pos => $token) {
+            if (is_array($token)
+                && $token[0] === T_STRING
+                && isset($tokens[$pos - 1])
+                && is_array($tokens[$pos - 1])
+                && $tokens[$pos - 1][0] === T_NEW
+            ) {
+                $instantiated[] = $token[1];
+            }
+        }
+
+        return $instantiated;
+    }
 }
 
 class ParamAnalyzer implements ContentAnalyzer
@@ -737,8 +818,12 @@ class ParamAnalyzer implements ContentAnalyzer
         foreach ($tokens as $token) {
             if (!$inParam && $token === '(') {
                 $inParam = true;
+                continue;
             } elseif ($inParam && $nestedListLevel === 0 && $token === ')') {
-                yield $this->createParam($currParamTokens);
+                if (!empty($currParamTokens)) {
+                    yield $this->createParam($currParamTokens);
+                }
+
                 break;
             }
 
