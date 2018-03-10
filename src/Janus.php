@@ -735,6 +735,7 @@ class FunctionAnalyzer implements ContentAnalyzer
         }
 
         $functionComponent->params  = $this->extractParams($headerTokens);
+        $functionComponent->returnType = $this->extractReturnTypeHint($headerTokens);
         $functionComponent->callMethods = $this->extractCalledFunctions($innerTokens);
         $functionComponent->instantiated = $this->extractInstantiatedClasses($innerTokens);
         $functionComponent->usedConstants = $this->extractConstants($innerTokens);
@@ -928,6 +929,36 @@ class FunctionAnalyzer implements ContentAnalyzer
 
         return $constants;
     }
+
+    private function extractReturnTypeHint(array $tokens)
+    {
+        $typehint = null;
+
+        foreach ($tokens as $pos => $token) {
+            if ($token !== ':') {
+                continue;
+            }
+
+            $typehintTokens = array_slice($tokens, $pos);
+            $typehint = array_reduce($typehintTokens, function ($acc, $token) {
+                if ($token === '?') {
+                    return '?';
+                }
+
+                if (!is_array($token) || !in_array($token[0], [T_NS_SEPARATOR, T_STRING])) {
+                    return $acc;
+                }
+
+                return is_string($acc)
+                    ? $acc . $token[1]
+                    : $token[1];
+            });
+
+            return $typehint;
+        }
+
+        return $typehint;
+    }
 }
 
 class ParamAnalyzer implements ContentAnalyzer
@@ -1104,7 +1135,7 @@ echo "Peak memory : " . round(memory_get_peak_usage(true) / 1024 / 1024, 3) . "M
 function analyzeDir(string $path)
 {
     foreach (scandir($path) as $file) {
-        if (in_array($file, ['.', '..'])) {
+        if (in_array($file, ['.', '..', 'cache'])) {
             continue;
         }
 
